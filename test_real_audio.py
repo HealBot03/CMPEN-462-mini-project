@@ -157,6 +157,7 @@ def resolve_device(device: str | None) -> int | str | None:
 
 
 # generate reference audio and save to disk
+"""
 def load_reference(args: argparse.Namespace) -> tuple[int, np.ndarray, np.ndarray]:
     fs = int(args.samplerate)
     block_samples = max(1, int(args.block_samples))
@@ -171,6 +172,27 @@ def load_reference(args: argparse.Namespace) -> tuple[int, np.ndarray, np.ndarra
     wavfile.write(args.phone_preamble_out, fs, float_to_int16(phone_signal))
     print(f"Exported phone playback preamble to {args.phone_preamble_out}")
 
+    return fs, base_block, phone_signal
+    """
+
+def load_reference(args: argparse.Namespace) -> tuple[int, np.ndarray, np.ndarray]:
+    fs = int(args.samplerate)
+    block_samples = max(1, int(args.block_samples))
+    # ensure 'preamble_external.wav' is in your project folder
+    try:
+        file_fs, external_audio = wavfile.read("preamble_external.wav")
+    except FileNotFoundError:
+        raise FileNotFoundError("could not find preamble_external.wav")
+
+    # convert to mono float and remove dc offset
+    full_preamble = to_mono_float(external_audio)
+
+    # equires the base_block to match the fft block size N
+    base_block = full_preamble[:block_samples] 
+    phone_signal = full_preamble 
+
+    print(f"loaded external preamble | fs={file_fs}hz | total samples={len(phone_signal)}")
+    
     return fs, base_block, phone_signal
 
 
