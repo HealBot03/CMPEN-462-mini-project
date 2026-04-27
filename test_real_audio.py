@@ -1,3 +1,4 @@
+# import required libraries for type hinting and timing
 from __future__ import annotations
 
 import argparse
@@ -5,47 +6,45 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+# import external math and plotting libraries
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy import signal
 from scipy.io import wavfile
 
+# import local signal processing modules
+from generate_preamble import (
+    BASE_PREAMBLE_SAMPLES,
+    DEFAULT_SAMPLE_RATE,
+    PREAMBLE_REPEATS,
+    generate_preamble,
+    float_to_int16,
+)
+from signal_math import compute_distance
+
+# try to load audio device library
 try:
     import sounddevice as sd
 except ImportError:  # pragma: no cover - handled at runtime
     sd = None
 
-# speed of sound used for sample to distance conversion
 
-SPEED_OF_SOUND_M_S = 343.0
-
-
-# output container for one accepted echo estimate
+# hold echo estimation results
 @dataclass
 class EchoEstimate:
     distance_m: float
-    direct_idx: int
-    echo_idx: int
-    direct_peak: float
-    echo_peak: float
-    echo_ratio: float
-    echo_snr: float
-    burst_snr: float
+    circular_gap_samples: int
+    peak_indices: tuple[int, int]
+    peak_magnitudes: tuple[float, float]
     cir: np.ndarray
 
 
+# setup and return command line arguments
 def parse_args() -> argparse.Namespace:
-    # parse cli options for live and file analysis
     parser = argparse.ArgumentParser(
         description=(
             "Estimate reflector distance from live microphone audio or a WAV file "
-            "using the training sequence stored in preamble.wav."
+            "using block-based FFT deconvolution."
         )
-    )
-    parser.add_argument(
-        "--preamble",
-        default="preamble.wav",
-        help="Reference training sequence used for matched filtering.",
     )
     parser.add_argument(
         "--input-file",
@@ -63,25 +62,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--samplerate",
         type=int,
-        help="Override the input sample rate. Defaults to the preamble sample rate.",
+        default=DEFAULT_SAMPLE_RATE,
+        help="Input sample rate in Hz.",
     )
     parser.add_argument(
-        "--window-seconds",
-        type=float,
-        default=0.8,
-        help="Rolling analysis window length in seconds.",
+        "--block-samples",
+        type=int,
+        default=BASE_PREAMBLE_SAMPLES,
+        help="Processing block size in samples. Use 4096 to match the CMPEN pipeline.",
     )
     parser.add_argument(
-        "--chunk-seconds",
-        type=float,
-        default=0.1,
-        help="Microphone chunk length in seconds for live mode.",
-    )
-    parser.add_argument(
-        "--step-seconds",
-        type=float,
-        default=0.2,
-        help="Sliding step used when analyzing a WAV file.",
+        "--preamble-repeats",
+        type=int,
+        default=PREAMBLE_REPEATS,
+        help="How many times to tile the 4096-sample base block for phone playback.",
     )
     parser.add_argument(
         "--duration",
@@ -89,58 +83,39 @@ def parse_args() -> argparse.Namespace:
         help="Optional live capture duration in seconds. Ctrl+C also stops the script.",
     )
     parser.add_argument(
-        "--lowcut",
-        type=float,
-        default=900.0,
-        help="Band-pass low cutoff in Hz. Helps reject fan noise and room rumble.",
-    )
-    parser.add_argument(
-        "--highcut",
-        type=float,
-        default=10500.0,
-        help="Band-pass high cutoff in Hz.",
-    )
-    parser.add_argument(
-        "--filter-order",
+        "--probe-seed",
         type=int,
-        default=6,
-        help="Butterworth filter order.",
+        default=7,
+        help="Random seed used for Gaussian white-noise base block generation.",
     )
     parser.add_argument(
-        "--min-distance",
+        "--epsilon-scale",
         type=float,
-        default=0.15,
-        help="Minimum reflector distance in meters for echo search.",
+        default=0.05,
+        help="Scaled epsilon in H=Y/(X+epsilon), where epsilon=epsilon_scale*max(|X|).",
     )
     parser.add_argument(
-        "--max-distance",
+        "--trigger-peak-ratio",
         type=float,
-        default=1.2,
-        help="Maximum reflector distance in meters for echo search.",
+        default=10.0,
+        help="Live mode trigger threshold: strongest CIR peak must be this multiple of median CIR noise floor.",
     )
     parser.add_argument(
-        "--min-echo-ratio",
-        type=float,
-        default=0.18,
-        help="Minimum echo/direct peak ratio before reporting a distance.",
-    )
-    parser.add_argument(
-        "--min-echo-snr",
-        type=float,
-        default=5.0,
-        help="Minimum echo/noise ratio before reporting a distance.",
-    )
-    parser.add_argument(
-        "--min-burst-snr",
-        type=float,
-        default=25.0,
-        help="Minimum direct-burst/noise ratio before trusting that a chirp was detected.",
+        "--trigger-trials",
+        type=int,
+        default=0,
+        help="Number of valid peak-triggered trials before freeze; use 0 for infinite trials.",
     )
     parser.add_argument(
         "--smooth",
         type=int,
         default=5,
         help="Median filter length applied to the printed distance.",
+    )
+    parser.add_argument(
+        "--phone-preamble-out",
+        default="preamble.wav",
+        help="Mono WAV output path for the 4x tiled phone playback preamble.",
     )
     parser.add_argument(
         "--save-plot",
@@ -155,16 +130,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def normalize_audio(audio: np.ndarray) -> np.ndarray:
-    # scale waveform to unit peak
-    peak = np.max(np.abs(audio))
-    if peak < 1e-12:
-        return audio.astype(np.float32, copy=False)
-    return (audio / peak).astype(np.float32, copy=False)
-
-
+# convert audio to mono floating point array and remove dc offset
 def to_mono_float(audio: np.ndarray) -> np.ndarray:
-    # convert to mono float and remove dc offset
     audio = np.asarray(audio)
     if audio.ndim > 1:
         audio = audio[:, 0]
@@ -175,12 +142,12 @@ def to_mono_float(audio: np.ndarray) -> np.ndarray:
     else:
         audio = audio.astype(np.float32, copy=False)
 
-    audio = audio - np.mean(audio)
-    return audio
+    # math: normalize by subtracting the mean
+    return (audio - np.mean(audio)).astype(np.float32, copy=False)
 
 
+# parse device id or name for audio stream
 def resolve_device(device: str | None) -> int | str | None:
-    # parse device as index when possible
     if device is None:
         return None
     try:
@@ -189,186 +156,134 @@ def resolve_device(device: str | None) -> int | str | None:
         return device
 
 
-def load_reference(reference_path: str) -> tuple[int, np.ndarray]:
-    # load and normalize the preamble reference
-    fs, preamble = wavfile.read(reference_path)
-    preamble = normalize_audio(to_mono_float(preamble))
-    return fs, preamble
+# generate reference audio and save to disk
+def load_reference(args: argparse.Namespace) -> tuple[int, np.ndarray, np.ndarray]:
+    fs = int(args.samplerate)
+    block_samples = max(1, int(args.block_samples))
+    preamble_repeats = max(1, int(args.preamble_repeats))
 
-
-def build_bandpass(fs: int, lowcut: float, highcut: float, order: int) -> np.ndarray:
-    # design stable bandpass filter in sos form
-    nyquist = fs / 2.0
-    clipped_low = max(20.0, lowcut)
-    clipped_high = min(highcut, nyquist * 0.95)
-    if clipped_low >= clipped_high:
-        raise ValueError(
-            f"Invalid band-pass range: lowcut={lowcut} Hz, highcut={highcut} Hz, fs={fs} Hz"
-        )
-    return signal.butter(order, [clipped_low, clipped_high], btype="bandpass", fs=fs, output="sos")
-
-
-def apply_bandpass(audio: np.ndarray, sos: np.ndarray) -> np.ndarray:
-    # apply zero phase filter when possible
-    if len(audio) < 64:
-        return signal.sosfilt(sos, audio).astype(np.float32, copy=False)
-    try:
-        filtered = signal.sosfiltfilt(sos, audio)
-    except ValueError:
-        filtered = signal.sosfilt(sos, audio)
-    return filtered.astype(np.float32, copy=False)
-
-
-def estimate_distance(
-    audio_window: np.ndarray,
-    filtered_preamble: np.ndarray,
-    sos: np.ndarray,
-    fs: int,
-    min_distance_m: float,
-    max_distance_m: float,
-    min_echo_ratio: float,
-    min_echo_snr: float,
-    min_burst_snr: float,
-) -> EchoEstimate | None:
-    # estimate direct and echo peaks from matched filter cir
-    window = to_mono_float(audio_window)
-    if np.max(np.abs(window)) < 1e-4:
-        return None
-
-    filtered_window = normalize_audio(apply_bandpass(window, sos))
-    cir = np.abs(signal.fftconvolve(filtered_window, filtered_preamble[::-1], mode="same"))
-
-    margin = len(filtered_preamble) // 2
-    valid_start = margin
-    valid_stop = len(cir) - margin
-    if valid_stop <= valid_start:
-        return None
-
-    burst_noise_floor = float(np.median(cir[valid_start:valid_stop])) + 1e-12
-    direct_idx = int(np.argmax(cir[valid_start:valid_stop])) + valid_start
-    direct_peak = float(cir[direct_idx]) + 1e-12
-    burst_snr = direct_peak / burst_noise_floor
-    if burst_snr < min_burst_snr:
-        return None
-
-    min_gap = max(1, int(round((2.0 * min_distance_m) * fs / SPEED_OF_SOUND_M_S)))
-    max_gap = max(min_gap + 1, int(round((2.0 * max_distance_m) * fs / SPEED_OF_SOUND_M_S)))
-
-    search_start = direct_idx + min_gap
-    search_stop = min(len(cir), direct_idx + max_gap)
-    if search_stop <= search_start + 3:
-        return None
-
-    search_region = cir[search_start:search_stop]
-    noise_floor = float(np.median(search_region)) + 1e-12
-    min_height = max(noise_floor * 2.5, float(np.max(search_region)) * 0.35)
-    min_prominence = max(noise_floor * 1.5, float(np.max(search_region)) * 0.10)
-
-    peak_indices, properties = signal.find_peaks(
-        search_region,
-        height=min_height,
-        prominence=min_prominence,
-        distance=max(6, min_gap // 4),
+    base_block, phone_signal = generate_preamble(
+        base_samples=block_samples,
+        repeats=preamble_repeats,
+        seed=args.probe_seed,
     )
 
-    if len(peak_indices) == 0:
-        echo_idx = int(np.argmax(search_region)) + search_start
-    else:
-        peak_heights = properties["peak_heights"]
-        peak_scores = properties["prominences"] + 0.35 * peak_heights
-        echo_idx = int(peak_indices[int(np.argmax(peak_scores))]) + search_start
+    wavfile.write(args.phone_preamble_out, fs, float_to_int16(phone_signal))
+    print(f"Exported phone playback preamble to {args.phone_preamble_out}")
 
-    echo_peak = float(cir[echo_idx])
-    echo_ratio = echo_peak / direct_peak
-    echo_snr = echo_peak / noise_floor
-    if echo_ratio < min_echo_ratio or echo_snr < min_echo_snr:
+    return fs, base_block, phone_signal
+
+
+# process block to find distance using signal math
+def estimate_distance(
+    audio_block: np.ndarray,
+    preamble_block: np.ndarray,
+    fs: int,
+    epsilon_scale: float,
+) -> EchoEstimate | None:
+    block = to_mono_float(audio_block)
+    if np.max(np.abs(block)) < 1e-5:
         return None
 
-    gap_samples = echo_idx - direct_idx
-    distance_m = SPEED_OF_SOUND_M_S * gap_samples / fs / 2.0
+    distance_m, cir, peak_indices, peak_magnitudes, circular_gap = compute_distance(
+        rx_block=block,
+        preamble_block=preamble_block,
+        fs=fs,
+        epsilon_scale=epsilon_scale,
+    )
+    if (
+        distance_m is None
+        or peak_indices is None
+        or peak_magnitudes is None
+        or circular_gap is None
+    ):
+        return None
+
     return EchoEstimate(
         distance_m=distance_m,
-        direct_idx=direct_idx,
-        echo_idx=echo_idx,
-        direct_peak=direct_peak,
-        echo_peak=echo_peak,
-        echo_ratio=echo_ratio,
-        echo_snr=echo_snr,
-        burst_snr=burst_snr,
+        circular_gap_samples=circular_gap,
+        peak_indices=peak_indices,
+        peak_magnitudes=peak_magnitudes,
         cir=cir,
     )
 
 
+# math: calculate signal to noise ratio of highest peak
+def compute_peak_to_noise_ratio(estimate: EchoEstimate) -> float:
+    noise_floor = float(np.median(estimate.cir)) + 1e-12
+    peak = float(max(estimate.peak_magnitudes))
+    return peak / noise_floor
+
+
+# initialize interactive matplotlib figure
 def create_plot() -> tuple[plt.Figure, plt.Axes, object, tuple[object, object]]:
-    # initialize live cir plot objects
     plt.ion()
     fig, ax = plt.subplots(figsize=(10, 4.5))
     line, = ax.plot([], [], linewidth=2)
-    direct_marker = ax.axvline(0.0, color="tab:green", linestyle="--", linewidth=1.5, label="Direct")
-    echo_marker = ax.axvline(0.0, color="tab:red", linestyle="--", linewidth=1.5, label="Echo")
-    ax.set_title("Estimated CIR Around the Current Burst")
-    ax.set_xlabel("Relative reflector distance from direct path (m)")
-    ax.set_ylabel("Matched-filter magnitude")
+    peak1_marker = ax.axvline(0.0, color="tab:green", linestyle="--", linewidth=1.5, label="Peak 1")
+    peak2_marker = ax.axvline(0.0, color="tab:red", linestyle="--", linewidth=1.5, label="Peak 2")
+    ax.set_title("Block Deconvolution CIR Magnitude")
+    ax.set_xlabel("CIR sample index (circular)")
+    ax.set_ylabel("Magnitude")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
     fig.tight_layout()
-    return fig, ax, line, (direct_marker, echo_marker)
+    return fig, ax, line, (peak1_marker, peak2_marker)
 
 
+# update existing plot with new data
 def update_plot(
     ax: plt.Axes,
     line,
     markers,
     estimate: EchoEstimate,
-    fs: int,
-    max_distance_m: float,
     smoothed_distance_m: float,
 ) -> None:
-    # refresh plot with latest cir and markers
-    left_guard = max(80, int(0.02 * fs))
-    right_guard = max(160, int(round((2.0 * max_distance_m) * fs / SPEED_OF_SOUND_M_S)) + 80)
-    start = max(0, estimate.direct_idx - left_guard)
-    stop = min(len(estimate.cir), estimate.direct_idx + right_guard)
-    local_cir = estimate.cir[start:stop]
-    axis_m = (np.arange(start, stop) - estimate.direct_idx) * SPEED_OF_SOUND_M_S / fs / 2.0
+    axis_samples = np.arange(len(estimate.cir), dtype=np.int32)
+    line.set_data(axis_samples, estimate.cir)
+    markers[0].set_xdata([estimate.peak_indices[0], estimate.peak_indices[0]])
+    markers[1].set_xdata([estimate.peak_indices[1], estimate.peak_indices[1]])
 
-    line.set_data(axis_m, local_cir)
-    markers[0].set_xdata([0.0, 0.0])
-    markers[1].set_xdata([estimate.distance_m, estimate.distance_m])
-    ax.set_xlim(float(axis_m[0]), float(axis_m[-1]))
-    ax.set_ylim(0.0, float(np.max(local_cir)) * 1.1)
+    ax.set_xlim(0, max(1, len(estimate.cir) - 1))
+    ax.set_ylim(0.0, float(np.max(estimate.cir)) * 1.1)
     ax.set_title(
-        "Estimated CIR Around the Current Burst "
-        f"(instant={estimate.distance_m:.3f} m, smooth={smoothed_distance_m:.3f} m)"
+        "Block Deconvolution CIR Magnitude "
+        f"(instant={estimate.distance_m:.3f} m, smooth={smoothed_distance_m:.3f} m, "
+        f"gap={estimate.circular_gap_samples} samples)"
     )
     ax.figure.canvas.draw_idle()
     plt.pause(0.001)
 
 
-def save_snapshot(
-    output_path: str,
-    estimate: EchoEstimate | None,
-    fs: int,
-    max_distance_m: float,
-) -> None:
-    # save final cir snapshot image
+# export single frame of plot to file
+def save_snapshot(output_path: str, estimate: EchoEstimate | None) -> None:
     if estimate is None:
         return
 
     fig, ax = plt.subplots(figsize=(10, 4.5))
-    left_guard = max(80, int(0.02 * fs))
-    right_guard = max(160, int(round((2.0 * max_distance_m) * fs / SPEED_OF_SOUND_M_S)) + 80)
-    start = max(0, estimate.direct_idx - left_guard)
-    stop = min(len(estimate.cir), estimate.direct_idx + right_guard)
-    local_cir = estimate.cir[start:stop]
-    axis_m = (np.arange(start, stop) - estimate.direct_idx) * SPEED_OF_SOUND_M_S / fs / 2.0
+    axis_samples = np.arange(len(estimate.cir), dtype=np.int32)
 
-    ax.plot(axis_m, local_cir, linewidth=2)
-    ax.axvline(0.0, color="tab:green", linestyle="--", linewidth=1.5, label="Direct")
-    ax.axvline(estimate.distance_m, color="tab:red", linestyle="--", linewidth=1.5, label="Echo")
-    ax.set_title(f"CIR Snapshot (estimated distance = {estimate.distance_m:.3f} m)")
-    ax.set_xlabel("Relative reflector distance from direct path (m)")
-    ax.set_ylabel("Matched-filter magnitude")
+    ax.plot(axis_samples, estimate.cir, linewidth=2)
+    ax.axvline(
+        estimate.peak_indices[0],
+        color="tab:green",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"Peak 1 ({estimate.peak_indices[0]})",
+    )
+    ax.axvline(
+        estimate.peak_indices[1],
+        color="tab:red",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"Peak 2 ({estimate.peak_indices[1]})",
+    )
+    ax.set_title(
+        f"Block Deconvolution CIR Snapshot (distance = {estimate.distance_m:.3f} m, "
+        f"gap = {estimate.circular_gap_samples} samples)"
+    )
+    ax.set_xlabel("CIR sample index (circular)")
+    ax.set_ylabel("Magnitude")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
     fig.tight_layout()
@@ -376,59 +291,54 @@ def save_snapshot(
     plt.close(fig)
 
 
+# read from wav file and compute distances block by block
 def run_file_mode(
     audio_path: str,
-    filtered_preamble: np.ndarray,
-    sos: np.ndarray,
+    preamble_block: np.ndarray,
     fs: int,
     args: argparse.Namespace,
 ) -> EchoEstimate | None:
-    # scan wav with sliding windows and keep valid estimates
     file_fs, audio = wavfile.read(audio_path)
     if file_fs != fs:
         raise ValueError(
-            f"Input file sample rate is {file_fs} Hz, but preamble/sample rate is {fs} Hz."
+            f"Input file sample rate is {file_fs} Hz, but requested sample rate is {fs} Hz."
         )
 
     audio = to_mono_float(audio)
-    window_samples = int(round(args.window_seconds * fs))
-    step_samples = max(1, int(round(args.step_seconds * fs)))
+    block_samples = len(preamble_block)
+
     smoothing = deque(maxlen=max(1, args.smooth))
     accepted_estimates: list[tuple[float, EchoEstimate]] = []
 
-    for start in range(0, max(1, len(audio) - window_samples + 1), step_samples):
-        window = audio[start : start + window_samples]
-        if len(window) < window_samples:
-            window = np.pad(window, (0, window_samples - len(window)))
+    for start in range(0, len(audio), block_samples):
+        block = audio[start : start + block_samples]
+        if len(block) < block_samples:
+            block = np.pad(block, (0, block_samples - len(block)))
 
         estimate = estimate_distance(
-            window,
-            filtered_preamble,
-            sos,
+            block,
+            preamble_block,
             fs,
-            args.min_distance,
-            args.max_distance,
-            args.min_echo_ratio,
-            args.min_echo_snr,
-            args.min_burst_snr,
+            args.epsilon_scale,
         )
         if estimate is None:
             continue
 
+        # math: apply median filter to distance values
         smoothing.append(estimate.distance_m)
         smooth_distance = float(np.median(np.asarray(smoothing)))
         print(
-            f"t={start / fs:6.2f}s  "
+            f"block={start // block_samples:5d}  "
+            f"t={start / fs:7.3f}s  "
             f"instant={estimate.distance_m:0.3f} m  "
             f"smooth={smooth_distance:0.3f} m  "
-            f"echo/direct={estimate.echo_ratio:0.2f}  "
-            f"echo/noise={estimate.echo_snr:0.1f}  "
-            f"burst/noise={estimate.burst_snr:0.1f}"
+            f"gap={estimate.circular_gap_samples:5d} samples  "
+            f"peaks={estimate.peak_indices}"
         )
         accepted_estimates.append((start / fs, estimate))
 
     if not accepted_estimates:
-        print("No clear reflector echo was detected in the WAV file.")
+        print("No valid two-peak deconvolution response was detected in the WAV file.")
         return None
 
     distances = np.asarray([estimate.distance_m for _, estimate in accepted_estimates], dtype=np.float32)
@@ -437,51 +347,54 @@ def run_file_mode(
         accepted_estimates,
         key=lambda item: (
             abs(item[1].distance_m - median_distance),
-            -item[1].echo_snr,
+            -(item[1].peak_magnitudes[0] + item[1].peak_magnitudes[1]),
         ),
     )
     print(
         f"Median distance from file: {median_distance:.3f} m "
-        f"(representative window at t={representative_time:.2f}s, "
-        f"echo/direct={representative_estimate.echo_ratio:.2f}, "
-        f"echo/noise={representative_estimate.echo_snr:.1f}, "
-        f"burst/noise={representative_estimate.burst_snr:.1f})"
+        f"(representative block at t={representative_time:.3f}s, "
+        f"gap={representative_estimate.circular_gap_samples} samples, "
+        f"peaks={representative_estimate.peak_indices})"
     )
     return representative_estimate
 
 
+# read from live mic and compute distances
 def run_live_mode(
-    filtered_preamble: np.ndarray,
-    sos: np.ndarray,
+    preamble_block: np.ndarray,
     fs: int,
     args: argparse.Namespace,
 ) -> EchoEstimate | None:
-    # stream mic audio and print rolling distance estimates
     if sd is None:
         raise RuntimeError(
             "Live mode requires sounddevice. Install it with: pip install sounddevice"
         )
 
     device = resolve_device(args.device)
-    window_samples = int(round(args.window_seconds * fs))
-    chunk_samples = max(1, int(round(args.chunk_seconds * fs)))
-    rolling_audio = np.zeros(window_samples, dtype=np.float32)
-    collected = 0
+    block_samples = len(preamble_block)
+    trigger_trials = int(args.trigger_trials)
+    unlimited_trials = trigger_trials <= 0
+
     last_estimate = None
     smoothing = deque(maxlen=max(1, args.smooth))
+    triggers_captured = 0
 
     plot_state = None
     if not args.no_plot:
         plot_state = create_plot()
 
-    print(f"Listening at {fs} Hz. Press Ctrl+C to stop.")
+    print(
+        f"Listening at {fs} Hz with block size {block_samples}. "
+        f"Collecting {'infinite' if unlimited_trials else trigger_trials} triggered trial(s). "
+        "Press Ctrl+C to stop."
+    )
     if device is not None:
         print(f"Using input device: {device}")
 
     start_time = time.time()
     with sd.InputStream(
         samplerate=fs,
-        blocksize=chunk_samples,
+        blocksize=block_samples,
         channels=1,
         dtype="float32",
         device=device,
@@ -491,94 +404,101 @@ def run_live_mode(
             if args.duration is not None and (time.time() - start_time) >= args.duration:
                 break
 
-            chunk, overflowed = stream.read(chunk_samples)
-            samples = np.asarray(chunk[:, 0], dtype=np.float32)
-            rolling_audio = np.roll(rolling_audio, -len(samples))
-            rolling_audio[-len(samples) :] = samples
-            collected = min(window_samples, collected + len(samples))
+            chunk, overflowed = stream.read(block_samples)
+            block = np.asarray(chunk[:, 0], dtype=np.float32)
 
             if overflowed:
-                print("\nWarning: input overflow detected. Try a larger chunk size.")
-
-            if collected < window_samples:
-                continue
+                print("\nWarning: input overflow detected. Try a larger audio buffer.")
 
             estimate = estimate_distance(
-                rolling_audio,
-                filtered_preamble,
-                sos,
+                block,
+                preamble_block,
                 fs,
-                args.min_distance,
-                args.max_distance,
-                args.min_echo_ratio,
-                args.min_echo_snr,
-                args.min_burst_snr,
+                args.epsilon_scale,
             )
             if estimate is None:
-                print("\rListening... no clean echo yet.                                ", end="", flush=True)
+                print("\rListening... awaiting valid two-peak block response.    ", end="", flush=True)
+                continue
+
+            peak_to_noise = compute_peak_to_noise_ratio(estimate)
+            if peak_to_noise < float(args.trigger_peak_ratio):
+                print(
+                    "\rListening... peak below trigger "
+                    f"({peak_to_noise:0.2f}x < {args.trigger_peak_ratio:0.2f}x).    ",
+                    end="",
+                    flush=True,
+                )
                 continue
 
             last_estimate = estimate
+            triggers_captured += 1
             smoothing.append(estimate.distance_m)
             smooth_distance = float(np.median(np.asarray(smoothing)))
+            print()
             print(
-                "\r"
+                f"Trial {triggers_captured}"
+                f"{'/' + str(trigger_trials) if not unlimited_trials else ''} detected. "
                 f"Distance={smooth_distance:0.3f} m  "
                 f"instant={estimate.distance_m:0.3f} m  "
-                f"echo/direct={estimate.echo_ratio:0.2f}  "
-                f"echo/noise={estimate.echo_snr:0.1f}  "
-                f"burst/noise={estimate.burst_snr:0.1f}      ",
-                end="",
-                flush=True,
+                f"gap={estimate.circular_gap_samples:5d} samples  "
+                f"peaks={estimate.peak_indices}  "
+                f"peak/noise={peak_to_noise:0.2f}x"
             )
 
             if plot_state is not None:
                 _, ax, line, markers = plot_state
-                update_plot(ax, line, markers, estimate, fs, args.max_distance, smooth_distance)
+                update_plot(ax, line, markers, estimate, smooth_distance)
+
+            if (not unlimited_trials) and triggers_captured >= trigger_trials:
+                print("Reached requested number of triggered trials. Freezing on final result.")
+                break
+
+    if plot_state is not None and last_estimate is not None:
+        _, ax, line, markers = plot_state
+        final_smooth_distance = float(np.median(np.asarray(smoothing)))
+        update_plot(ax, line, markers, last_estimate, final_smooth_distance)
+        plt.ioff()
+        plt.show(block=True)
 
     print()
     return last_estimate
 
 
+# list all system audio devices
 def print_device_list() -> None:
-    # print available audio input and output devices
     if sd is None:
         raise RuntimeError("sounddevice is not installed, so devices cannot be listed.")
     print(sd.query_devices())
 
 
+# handle main script execution
 def main() -> None:
-    # wire setup then run file mode or live mode
     args = parse_args()
 
     if args.list_devices:
         print_device_list()
         return
 
-    fs, preamble = load_reference(args.preamble)
-    if args.samplerate is not None and args.samplerate != fs:
-        raise ValueError(
-            "This script assumes the incoming audio and preamble use the same sample rate. "
-            f"preamble={fs} Hz, requested={args.samplerate} Hz"
-        )
+    fs, preamble_block, phone_signal = load_reference(args)
+    print(
+        "Generated Gaussian preamble base block and phone playback signal "
+        f"(base={len(preamble_block)} samples, repeats={args.preamble_repeats}, "
+        f"phone_total={len(phone_signal)} samples, seed={args.probe_seed}, fs={fs} Hz)"
+    )
 
-    sos = build_bandpass(fs, args.lowcut, args.highcut, args.filter_order)
-    filtered_preamble = normalize_audio(apply_bandpass(preamble, sos))
     best_estimate = None
-
     try:
         if args.input_file:
-            best_estimate = run_file_mode(args.input_file, filtered_preamble, sos, fs, args)
+            best_estimate = run_file_mode(args.input_file, preamble_block, fs, args)
         else:
-            best_estimate = run_live_mode(filtered_preamble, sos, fs, args)
+            best_estimate = run_live_mode(preamble_block, fs, args)
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
-        save_snapshot(args.save_plot, best_estimate, fs, args.max_distance)
+        save_snapshot(args.save_plot, best_estimate)
         if best_estimate is not None:
             print(f"Saved CIR snapshot to {args.save_plot}")
 
 
 if __name__ == "__main__":
-    # script entry point
     main()
